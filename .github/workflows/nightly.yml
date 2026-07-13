@@ -1,0 +1,42 @@
+name: Nightly
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      version: nightly
+
+  publish:
+    name: Publish rolling nightly release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Replace the rolling nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Delete any previous nightly release + its tag first (ignore
+          # failure the very first time this runs, when neither exists
+          # yet), then create a fresh one pointing at the current main --
+          # a single rolling pre-release, not one per push.
+          gh release delete nightly --repo "${{ github.repository }}" --cleanup-tag --yes || true
+          gh release create nightly artifacts/*.tar.gz \
+            --repo "${{ github.repository }}" \
+            --title "Nightly ($(date -u +%Y-%m-%d))" \
+            --notes "Automated build from the latest main (${{ github.sha }}). May be unstable." \
+            --prerelease \
+            --target "${{ github.sha }}"

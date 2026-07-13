@@ -1,0 +1,76 @@
+name: Build binaries
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version string used in the packaged tarball's name (a git tag like v0.2.0, or 'nightly')"
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # Native arm64 Linux runner (GitHub-hosted, free for public repos)
+          # -- no cross-compilation toolchain needed at all.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          # musl build, for Alpine-based images (e.g. an arm64-only Fargate
+          # sidecar) -- a glibc (-gnu) binary won't run there at all. Same native arm64
+          # runner as the -gnu target above, so this is still a same-arch
+          # build, not a cross build; the only extra step is a musl C
+          # toolchain for mlua's vendored Lua sources to compile against.
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          # Both macOS targets run on the same (Apple Silicon) runner image
+          # rather than splitting across an Intel + ARM runner: Xcode's
+          # toolchain cross-compiles to x86_64 out of the box, and this
+          # avoids ever depending on GitHub's older Intel macOS runner
+          # label, which isn't guaranteed to stick around.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl + C toolchain (mlua vendored Lua needs a C compiler)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools build-essential
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="tlscap-${{ inputs.version }}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/tlscap" "$name/"
+          cp README.md LICENSE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlscap-${{ matrix.target }}
+          path: tlscap-${{ inputs.version }}-${{ matrix.target }}.tar.gz
+          retention-days: 7

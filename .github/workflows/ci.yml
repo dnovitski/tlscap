@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build dependencies (mlua vendored Lua needs a C toolchain)
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+      - run: cargo build --all-targets
+      - run: cargo test --all-targets
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings

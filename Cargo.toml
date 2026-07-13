@@ -1,0 +1,33 @@
+[package]
+name = "tlscap"
+version = "0.4.4"
+edition = "2024"
+description = "A tshark-compatible, Lua-pluggable, TLS-decrypting live packet capture tool"
+license = "MIT"
+repository = "https://github.com/dnovitski/tlscap"
+readme = "README.md"
+keywords = ["pcap", "wireshark", "tls", "lua", "capture"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+etherparse = "0.20.3"
+pcap-file = "2.0.0"
+clap = { version = "4.6.1", features = ["derive", "env"] }
+flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+thiserror = "2.0.18"
+aes-gcm = "0.11.0"
+chacha20poly1305 = "0.11.0"
+hkdf = "0.13.0"
+hmac = "0.13.0"
+sha2 = "0.11.0"
+hex = "0.4.3"
+
+[dev-dependencies]
+rcgen = "0.14.8"
+rustls = "0.23.41"
+
+[profile.release]
+strip = true
+lto = true
