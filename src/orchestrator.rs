@@ -5,7 +5,7 @@
 //! connection is genuinely still alive (the reason idle-timeout eviction is off by default; see
 //! below). FIN/RST is the primary, always-on eviction driver.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -59,10 +59,26 @@ struct Connection {
     state: Option<ConnectionState>,
     /// Leftover plaintext left undissected at the end of the previous decrypted record for this
     /// (connection, direction), carried forward and prepended to the next record's plaintext --
-    /// see `dissect_and_emit`. Bounded in practice to "at most one partial application message,"
-    /// since a well-formed protocol's messages aren't unboundedly large.
+    /// see `dissect_and_emit`. Hard-capped at `OrchestratorConfig::max_tail_bytes` (loudly, never
+    /// silently -- see `Orchestrator::tail_bytes_discarded`): "at most one partial application
+    /// message" is only true for a well-behaved dissector actually registered for this port: a
+    /// port with NO registered dissector at all never gets a tail retained in the first place
+    /// (see `dissect_and_emit`'s `Ok(None)` arm) precisely because that assumption doesn't hold
+    /// there -- confirmed the hard way, this used to accumulate every byte ever decrypted on such
+    /// a connection, for its entire lifetime.
     tail_c2s: Vec<u8>,
     tail_s2c: Vec<u8>,
+    /// Set once this direction has lost bytes to an unrecoverable reassembly gap (see
+    /// `PushOutcome::GapAbandoned`). Every byte from that point on is offset from the stream's
+    /// true TLS record boundaries, permanently: there is no resync mechanism (and none is
+    /// planned -- scanning forward for a plausible-looking record header has real false-positive
+    /// risk for negligible benefit, since the lost bytes are gone either way). Once set,
+    /// `process_frame` stops feeding this direction into its reassembler at all -- continuing
+    /// would otherwise decrypt-attempt an endless stream of garbage "records" (permanent
+    /// AuthFailed spam, wasted CPU) while never producing another real message for this
+    /// direction's remaining lifetime.
+    desynced_c2s: bool,
+    desynced_s2c: bool,
     meta: ConnectionMeta,
 }
 
@@ -76,6 +92,8 @@ impl Connection {
             state: None,
             tail_c2s: Vec::new(),
             tail_s2c: Vec::new(),
+            desynced_c2s: false,
+            desynced_s2c: false,
             meta: ConnectionMeta::default(),
         }
     }
@@ -85,6 +103,26 @@ impl Connection {
             &mut self.reassembler_c2s
         } else {
             &mut self.reassembler_s2c
+        }
+    }
+
+    fn is_desynced(&self, is_client_to_server: bool) -> bool {
+        if is_client_to_server {
+            self.desynced_c2s
+        } else {
+            self.desynced_s2c
+        }
+    }
+
+    /// Marks this direction permanently desynced and drops whatever its reassembler was
+    /// currently holding (garbage from this point on either way, no point keeping it around).
+    fn mark_desynced(&mut self, is_client_to_server: bool, max_pending_bytes: usize) {
+        if is_client_to_server {
+            self.desynced_c2s = true;
+            self.reassembler_c2s = StreamReassembler::with_max_pending_bytes(max_pending_bytes);
+        } else {
+            self.desynced_s2c = true;
+            self.reassembler_s2c = StreamReassembler::with_max_pending_bytes(max_pending_bytes);
         }
     }
 
@@ -178,12 +216,43 @@ fn canonical_flags(flags: &crate::pcap_input::TcpFlags) -> Vec<&'static str> {
     out
 }
 
+/// Generous relative to a single legitimate multi-record application message in this protocol (a
+/// handful of KB at most) -- see `OrchestratorConfig::max_tail_bytes`'s doc comment.
+pub const DEFAULT_MAX_TAIL_BYTES: usize = 1024 * 1024;
+
 pub struct OrchestratorConfig {
     pub idle_timeout: Option<Duration>,
     /// Only consulted if `idle_timeout` is `Some` -- how often the idle sweep actually walks the
     /// connection map, so its cost scales with this interval rather than every single packet.
     pub sweep_interval: Duration,
     pub max_pending_bytes: usize,
+    /// Hard cap on `Connection::tail_c2s`/`tail_s2c`'s size (see its doc comment) -- a safety net
+    /// for a dissector that's registered but doesn't consume much of what it's handed (a bug, or
+    /// a stream that never lets it make progress), NOT the primary defense: a port with no
+    /// dissector at all never accumulates a tail in the first place (see `dissect_and_emit`'s
+    /// `Ok(None)` arm). Exceeding this truncates the tail (keeping the most recently arrived
+    /// bytes) and is always reported via `Orchestrator::tail_bytes_discarded`, mirroring
+    /// `reassembly.rs`'s own `GapAbandoned` convention for the structurally identical risk.
+    /// Default is generous relative to a single legitimate multi-record application message in
+    /// this protocol (a handful of KB at most) without being a meaningful memory risk even at
+    /// thousands of concurrent connections.
+    pub max_tail_bytes: usize,
+    /// How often to force a full Lua GC cycle, always on (unlike `sweep_interval`, not gated on
+    /// any other setting). Every `dissect()` call creates GC-managed userdata (the Tvb/TvbRange
+    /// handles wrapping that record's reassembled bytes) that Lua's own incremental collector
+    /// only reclaims on its own pacing -- under sustained high throughput with little idle time
+    /// for that pacing to catch up, uncollected userdata (and the multi-KB buffers they keep
+    /// alive via `Rc`) can accumulate well beyond what `Orchestrator::lua_used_memory()` shows,
+    /// since that stat only reflects Lua's own internal accounting, not externally-`Rc`'d bytes a
+    /// userdata references. A short, bounded interval caps how much can pile up between
+    /// collections regardless of instantaneous traffic rate. CAVEAT: an apparent RSS improvement
+    /// from forcing this was originally measured against a replay that (by mistake) never loaded
+    /// a real dissector, so every record hit `Ok(None)` and no Tvb userdata was ever created at
+    /// all -- the "improvement" was very likely connections closing near the end of that replay,
+    /// not this GC call. Re-tested with a real dissector loaded: no measurable difference. Kept
+    /// as a still-reasonable, low-cost safety net for the mechanism it targets, not because it's
+    /// been shown to matter in practice.
+    pub lua_gc_interval: Duration,
 }
 
 impl Default for OrchestratorConfig {
@@ -192,6 +261,8 @@ impl Default for OrchestratorConfig {
             idle_timeout: None,
             sweep_interval: Duration::from_secs(60),
             max_pending_bytes: crate::reassembly::DEFAULT_MAX_PENDING_BYTES,
+            max_tail_bytes: DEFAULT_MAX_TAIL_BYTES,
+            lua_gc_interval: Duration::from_secs(5),
         }
     }
 }
@@ -202,10 +273,24 @@ pub struct Orchestrator {
     lua: LuaEngine,
     config: OrchestratorConfig,
     last_sweep: Instant,
+    last_lua_gc: Instant,
+    /// Ports we've already logged a "no dissector registered" notice for -- dissector
+    /// registration is 100% static (done once at startup, before any packet is processed), so
+    /// once a port is confirmed dissector-less it stays that way for the rest of the process's
+    /// lifetime; this dedupes the notice to once per port instead of once per record.
+    logged_no_dissector_ports: HashSet<u16>,
     /// Diagnostics, surfaced via public counters for startup/shutdown logging -- not load-bearing
     /// for correctness, just operator visibility into what's happening.
     pub evicted_connections: u64,
     pub gap_abandoned_bytes: u64,
+    /// Bytes dropped from a `Connection` tail for exceeding `config.max_tail_bytes` -- see
+    /// `OrchestratorConfig::max_tail_bytes`'s doc comment. Always incremented alongside a loud
+    /// stderr warning, never silently.
+    pub tail_bytes_discarded: u64,
+    /// (connection, direction) pairs permanently desynced by an unrecoverable reassembly gap --
+    /// see `Connection::desynced_c2s`'s doc comment. Always incremented alongside a loud stderr
+    /// warning, never silently.
+    pub connections_desynced: u64,
     /// Every TLS record pulled off the reassembled stream, regardless of outcome -- the
     /// denominator for the five counters below (they always sum to this total).
     pub tls_records_seen: u64,
@@ -245,8 +330,12 @@ impl Orchestrator {
             lua,
             config,
             last_sweep: Instant::now(),
+            last_lua_gc: Instant::now(),
+            logged_no_dissector_ports: HashSet::new(),
             evicted_connections: 0,
             gap_abandoned_bytes: 0,
+            tail_bytes_discarded: 0,
+            connections_desynced: 0,
             tls_records_seen: 0,
             tls_records_decrypted: 0,
             tls_records_nokey: 0,
@@ -289,13 +378,29 @@ impl Orchestrator {
     }
 
     /// Bytes currently tracked as live by the embedded Lua VM's own GC heap -- for memory-usage
-    /// diagnostics. See `LuaEngine::lua_used_memory`'s doc comment: every dissected message
-    /// creates GC-managed userdata that Lua's own garbage collector reclaims on its own pacing,
-    /// not deterministically -- if this climbs in step with `packets`/`messages` while
-    /// `connections`/`buffered_bytes`/`keylog_entries` stay flat, Lua GC pacing (not connection
-    /// tracking or the keylog) is the dominant memory-growth driver.
+    /// diagnostics. CAVEAT found the hard way (a real replay showed this stuck at 0 while RSS
+    /// climbed past 1GB): this only reflects Lua's own internal accounting (strings, tables,
+    /// userdata headers) -- it is blind to the size of a `Vec<u8>` a userdata references via `Rc`
+    /// (e.g. a `Tvb`'s reassembled-record bytes, see `tvb.rs`), since that memory lives on the
+    /// Rust/system heap, outside Lua's own arena. A `Tvb` awaiting GC still counts as ~0 bytes
+    /// here even while it keeps a multi-KB buffer alive. Don't treat this staying flat as proof
+    /// Lua GC pacing isn't a growth driver -- see `maybe_gc_lua`, which exists because it is one.
     pub fn lua_used_memory(&self) -> usize {
         self.lua.lua_used_memory()
+    }
+
+    /// Forces a full Lua GC cycle at most once per `config.lua_gc_interval`, always on (unlike
+    /// `maybe_sweep_idle`, not gated on any other setting). See `OrchestratorConfig::
+    /// lua_gc_interval`'s doc comment for why this exists: Lua's own incremental collector can
+    /// fall behind `dissect()`'s userdata-creation rate under sustained high throughput, letting
+    /// GC-managed buffers pile up well beyond what `lua_used_memory()` shows. Confirmed
+    /// empirically on a real-capture replay to measurably lower peak RSS.
+    fn maybe_gc_lua(&mut self) {
+        if self.last_lua_gc.elapsed() < self.config.lua_gc_interval {
+            return;
+        }
+        self.last_lua_gc = Instant::now();
+        self.lua.gc_collect();
     }
 
     /// Processes one captured TCP frame, returning (1) this frame's own `PacketEvent` -- always
@@ -363,7 +468,11 @@ impl Orchestrator {
         conn.meta.last_activity = Some(Instant::now());
 
         let payload = &packet_data[frame.payload_range.clone()];
-        if !payload.is_empty() {
+        // A direction that's already permanently desynced (see `Connection::desynced_c2s`'s doc
+        // comment) never gets fed into its reassembler again -- every byte from here on is offset
+        // from the stream's true TLS record boundaries anyway, so buffering it toward a "record"
+        // that will never validly complete is pure waste.
+        if !payload.is_empty() && !conn.is_desynced(is_client_to_server) {
             let outcome = conn.reassembler_for(is_client_to_server).push(
                 packet_index,
                 frame.seq,
@@ -377,6 +486,12 @@ impl Orchestrator {
                     key,
                     if is_client_to_server { "c2s" } else { "s2c" },
                     bytes
+                );
+                conn.mark_desynced(is_client_to_server, max_pending_bytes);
+                self.connections_desynced += 1;
+                eprintln!(
+                    "tlscap: WARNING connection {key:?} direction={} permanently desynced -- no further TLS records will be parsed for this direction (the other direction and this connection's packet-level events are unaffected)",
+                    if is_client_to_server { "c2s" } else { "s2c" },
                 );
             }
         }
@@ -395,6 +510,7 @@ impl Orchestrator {
         }
 
         self.maybe_sweep_idle();
+        self.maybe_gc_lua();
         (packet_event, out)
     }
 
@@ -568,40 +684,37 @@ impl Orchestrator {
         match self.lua.dissect(port, buf.clone()) {
             Ok(Some((mut dissected, consumed))) => {
                 let leftover = buf[consumed.min(buf.len())..].to_vec();
-                if let Some(conn) = self.connections.get_mut(key) {
-                    conn.set_tail(is_client_to_server, leftover);
-                }
+                self.set_tail_capped(key, is_client_to_server, leftover);
                 fields.entries.append(&mut dissected.entries);
                 fields.protocol = dissected.protocol;
                 fields.info = dissected.info;
                 fields.malformed = dissected.malformed;
             }
             Ok(None) => {
-                // No plugin registered for this port -- nothing to dissect. Restore the buffer
-                // as the tail unchanged (not consumed, not lost) in case a plugin for this port
-                // gets registered later is out of scope for v1, but at minimum this must not
-                // silently drop bytes: put them back so a future record's decrypt at least keeps
-                // them available for inspection via --verify-reassembly-style accounting.
-                // `try_unwrap` reliably succeeds here (dissect() returned before ever creating a
-                // Tvb, so our clone above is the only other handle) -- the `unwrap_or_else` clone
-                // fallback exists only for `Err(e)` below, where a Tvb's GC-managed userdata may
-                // still be holding a live handle (same reasoning as `dissect()`'s own `fields` Rc
-                // -- see lua/mod.rs's doc comment).
-                if let Some(conn) = self.connections.get_mut(key) {
-                    conn.set_tail(
-                        is_client_to_server,
-                        Rc::try_unwrap(buf).unwrap_or_else(|rc| (*rc).clone()),
+                // No plugin registered for this port. Dissector registration is 100% static (done
+                // once at startup, before any packet is processed) -- so unlike a genuine gap or a
+                // transient dissector error, this can NEVER resolve itself later in this process's
+                // lifetime. Retaining `buf` as a tail here used to mean accumulating every byte
+                // ever decrypted on such a connection, for its entire lifetime (confirmed via a
+                // real production capture reaching >1GB RSS on connections with no matching
+                // dissector) -- deliberately NOT restoring it: there is no future code path that
+                // will ever consume it. Logged once per port, not per record.
+                if self.logged_no_dissector_ports.insert(port) {
+                    eprintln!(
+                        "tlscap: no dissector registered for port {port} -- application data on this port will not be buffered or dissected for the rest of this process's lifetime"
                     );
                 }
             }
             Err(e) => {
                 eprintln!("tlscap: WARNING Lua dissector error on port {port}: {e}");
-                if let Some(conn) = self.connections.get_mut(key) {
-                    conn.set_tail(
-                        is_client_to_server,
-                        Rc::try_unwrap(buf).unwrap_or_else(|rc| (*rc).clone()),
-                    );
-                }
+                // Unlike `Ok(None)`, a dissector IS registered here -- a transient parse error on
+                // this one record doesn't mean future records on this connection won't dissect
+                // fine, so (capped) retention is still worthwhile. `try_unwrap` often fails here
+                // (a Tvb's GC-managed userdata may still hold a live handle -- same reasoning as
+                // `dissect()`'s own `fields` Rc, see lua/mod.rs's doc comment); the `unwrap_or_else`
+                // clone fallback covers that.
+                let restored = Rc::try_unwrap(buf).unwrap_or_else(|rc| (*rc).clone());
+                self.set_tail_capped(key, is_client_to_server, restored);
             }
         }
 
@@ -614,6 +727,26 @@ impl Orchestrator {
             fields,
             timestamp,
         });
+    }
+
+    /// Sets a connection's tail, first truncating to `config.max_tail_bytes` (keeping the most
+    /// recently arrived bytes, dropping the oldest) if it's over the cap -- see
+    /// `OrchestratorConfig::max_tail_bytes`'s doc comment. Always reported, never silent, mirroring
+    /// `reassembly.rs`'s `GapAbandoned` convention for the structurally identical risk.
+    fn set_tail_capped(&mut self, key: &ConnKey, is_client_to_server: bool, mut bytes: Vec<u8>) {
+        if bytes.len() > self.config.max_tail_bytes {
+            let discard = bytes.len() - self.config.max_tail_bytes;
+            bytes.drain(..discard);
+            self.tail_bytes_discarded += discard as u64;
+            eprintln!(
+                "tlscap: WARNING connection {key:?} direction={} tail exceeded max_tail_bytes ({}) -- discarded {discard} oldest byte(s)",
+                if is_client_to_server { "c2s" } else { "s2c" },
+                self.config.max_tail_bytes,
+            );
+        }
+        if let Some(conn) = self.connections.get_mut(key) {
+            conn.set_tail(is_client_to_server, bytes);
+        }
     }
 
     fn maybe_sweep_idle(&mut self) {
@@ -899,6 +1032,270 @@ mod tests {
             "no dissector ran, so there must be no application-layer fields at all"
         );
         assert_eq!(messages[0].fields.protocol, None);
+    }
+
+    /// Regression test for the real bug found via a local dhat/musl investigation: a port with no
+    /// registered dissector used to have its ENTIRE buffer restored as the tail on every single
+    /// record, unboundedly accumulating every byte ever decrypted on that connection for its
+    /// whole lifetime (confirmed via a real production capture reaching >1GB RSS this way).
+    /// Sends two records specifically -- one record alone wouldn't distinguish "tail correctly
+    /// stays empty" from "tail grew by one record's worth but happens to look fine after only a
+    /// single call."
+    #[test]
+    fn no_dissector_for_port_never_accumulates_a_tail() {
+        let client_random = [0x11u8; 32];
+        let secret = [0x22u8; 32];
+        let keylog = Keylog::parse(&format!(
+            "CLIENT_TRAFFIC_SECRET_0 {} {}\r\n",
+            hex::encode(client_random),
+            hex::encode(secret)
+        ));
+        let keys = RecordKeys::derive(&secret, AeadAlgorithm::Aes128Gcm).unwrap();
+        let mut orch = new_test_orchestrator(keylog);
+
+        const UNREGISTERED_SERVER: (IpAddr, u16) = (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 12345);
+
+        let syn_seq = 7000u32;
+        let syn = tcp_frame(
+            CLIENT,
+            UNREGISTERED_SERVER,
+            syn_seq,
+            TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
+            0..0,
+        );
+        orch.process_frame(&syn, 0, &[], Duration::ZERO);
+
+        let hello = client_hello_record(client_random);
+        let hello_seq = syn_seq.wrapping_add(1);
+        let hello_frame = tcp_frame(
+            CLIENT,
+            UNREGISTERED_SERVER,
+            hello_seq,
+            TcpFlags::default(),
+            0..hello.len(),
+        );
+        orch.process_frame(&hello_frame, 1, &hello, Duration::ZERO);
+
+        let mut seq = hello_seq.wrapping_add(hello.len() as u32);
+        for i in 0..2u64 {
+            let record = app_data_record(&keys, i, format!("record #{i}").as_bytes());
+            let frame = tcp_frame(
+                CLIENT,
+                UNREGISTERED_SERVER,
+                seq,
+                TcpFlags::default(),
+                0..record.len(),
+            );
+            let (_, messages) = orch.process_frame(&frame, 2 + i as usize, &record, Duration::ZERO);
+            assert_eq!(messages.len(), 1, "record #{i} must still decrypt and emit");
+            seq = seq.wrapping_add(record.len() as u32);
+        }
+
+        let key = conn_key(CLIENT, UNREGISTERED_SERVER);
+        let conn = orch
+            .connections
+            .get(&key)
+            .expect("connection must still exist");
+        assert_eq!(
+            conn.tail_c2s.len(),
+            0,
+            "a port with no dissector must never accumulate a tail, no matter how many records arrive"
+        );
+        assert_eq!(orch.tail_bytes_discarded, 0);
+    }
+
+    /// A dissector that IS registered but never consumes anything (e.g. buggy, or a stream that
+    /// never lets it make progress) must still be bounded by `max_tail_bytes` -- unlike the
+    /// no-dissector-at-all case, this tail is legitimately worth keeping (a future record might
+    /// complete the parse), so it's capped rather than dropped entirely.
+    #[test]
+    fn oversized_tail_gets_truncated_and_reported() {
+        let client_random = [0x33u8; 32];
+        let secret = [0x44u8; 32];
+        let keylog = Keylog::parse(&format!(
+            "CLIENT_TRAFFIC_SECRET_0 {} {}\r\n",
+            hex::encode(client_random),
+            hex::encode(secret)
+        ));
+        let keys = RecordKeys::derive(&secret, AeadAlgorithm::Aes128Gcm).unwrap();
+
+        const NEVER_CONSUMES: &str = r#"
+            local proto = Proto("neverconsumes", "NeverConsumes")
+            function proto.dissector(tvb, pinfo, tree)
+                return 0
+            end
+            DissectorTable.get("tls.port"):add(9410, proto)
+        "#;
+        let lua = LuaEngine::new().unwrap();
+        lua.load_plugin_str(NEVER_CONSUMES, "never_consumes.lua")
+            .unwrap();
+        let mut orch = Orchestrator::new(
+            KeylogSource::from_parsed(keylog),
+            lua,
+            OrchestratorConfig {
+                max_tail_bytes: 50,
+                ..OrchestratorConfig::default()
+            },
+        );
+
+        let syn_seq = 8000u32;
+        let syn = tcp_frame(
+            CLIENT,
+            SERVER,
+            syn_seq,
+            TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
+            0..0,
+        );
+        orch.process_frame(&syn, 0, &[], Duration::ZERO);
+
+        let hello = client_hello_record(client_random);
+        let hello_seq = syn_seq.wrapping_add(1);
+        let hello_frame = tcp_frame(
+            CLIENT,
+            SERVER,
+            hello_seq,
+            TcpFlags::default(),
+            0..hello.len(),
+        );
+        orch.process_frame(&hello_frame, 1, &hello, Duration::ZERO);
+
+        // Each record is well under the 50-byte cap on its own, but the dissector never consumes
+        // anything, so the tail keeps growing record over record until it blows through the cap.
+        let mut seq = hello_seq.wrapping_add(hello.len() as u32);
+        for i in 0..5u64 {
+            let record = app_data_record(&keys, i, b"0123456789012345"); // 16 bytes
+            let frame = tcp_frame(CLIENT, SERVER, seq, TcpFlags::default(), 0..record.len());
+            orch.process_frame(&frame, 2 + i as usize, &record, Duration::ZERO);
+            seq = seq.wrapping_add(record.len() as u32);
+        }
+
+        assert!(
+            orch.tail_bytes_discarded > 0,
+            "exceeding max_tail_bytes must be reported via the counter, never silent"
+        );
+        let key = conn_key(CLIENT, SERVER);
+        let conn = orch
+            .connections
+            .get(&key)
+            .expect("connection must still exist");
+        assert!(
+            conn.tail_c2s.len() <= 50,
+            "tail must never be allowed to grow past max_tail_bytes, got {}",
+            conn.tail_c2s.len()
+        );
+    }
+
+    /// After an unrecoverable reassembly gap, every subsequent byte on that direction is offset
+    /// from the stream's true TLS record boundaries -- reported here in real production logs as
+    /// repeated `GapAbandoned` warnings for the same connection. Without this fix the orchestrator
+    /// would keep trying to parse "records" out of that misaligned stream forever (permanent
+    /// AuthFailed spam, wasted CPU, and -- since a claimed record length can be up to 65535 bytes
+    /// -- up to ~64KB buffered per bogus "record" while waiting for one that will never validly
+    /// complete). This confirms the fix: once desynced, no further messages are ever emitted for
+    /// that direction, and the reassembler stops accumulating anything for it at all.
+    #[test]
+    fn gap_abandoned_permanently_desyncs_a_direction() {
+        let client_random = [0x55u8; 32];
+        let secret = [0x66u8; 32];
+        let keylog = Keylog::parse(&format!(
+            "CLIENT_TRAFFIC_SECRET_0 {} {}\r\n",
+            hex::encode(client_random),
+            hex::encode(secret)
+        ));
+        let keys = RecordKeys::derive(&secret, AeadAlgorithm::Aes128Gcm).unwrap();
+
+        let lua = LuaEngine::new().unwrap();
+        lua.load_plugin_str(FIXTURE_DISSECTOR, "fixture.lua")
+            .unwrap();
+        let mut orch = Orchestrator::new(
+            KeylogSource::from_parsed(keylog),
+            lua,
+            OrchestratorConfig {
+                max_pending_bytes: 20,
+                ..OrchestratorConfig::default()
+            },
+        );
+
+        let syn_seq = 9000u32;
+        let syn = tcp_frame(
+            CLIENT,
+            SERVER,
+            syn_seq,
+            TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
+            0..0,
+        );
+        orch.process_frame(&syn, 0, &[], Duration::ZERO);
+
+        let hello = client_hello_record(client_random);
+        let hello_seq = syn_seq.wrapping_add(1);
+        let hello_frame = tcp_frame(
+            CLIENT,
+            SERVER,
+            hello_seq,
+            TcpFlags::default(),
+            0..hello.len(),
+        );
+        orch.process_frame(&hello_frame, 1, &hello, Duration::ZERO);
+        let after_hello_seq = hello_seq.wrapping_add(hello.len() as u32);
+
+        // Two out-of-order segments, both leaving a gap before them, together exceeding
+        // max_pending_bytes (20) -- triggers GapAbandoned on the second push.
+        let far_seq = after_hello_seq.wrapping_add(1000);
+        let frame_a = tcp_frame(CLIENT, SERVER, far_seq, TcpFlags::default(), 0..15);
+        orch.process_frame(&frame_a, 2, &[0xAA; 15], Duration::ZERO);
+        let frame_b = tcp_frame(
+            CLIENT,
+            SERVER,
+            far_seq.wrapping_add(100),
+            TcpFlags::default(),
+            0..15,
+        );
+        orch.process_frame(&frame_b, 3, &[0xBB; 15], Duration::ZERO);
+
+        assert!(
+            orch.gap_abandoned_bytes > 0,
+            "the second out-of-order push must exceed max_pending_bytes and trigger GapAbandoned"
+        );
+        assert_eq!(orch.connections_desynced, 1);
+
+        // A perfectly well-formed record, sent at whatever sequence number the connection is
+        // still tracking -- must NOT produce a message: the direction is permanently desynced.
+        let record = app_data_record(&keys, 0, b"this must never come out");
+        let frame = tcp_frame(
+            CLIENT,
+            SERVER,
+            after_hello_seq,
+            TcpFlags::default(),
+            0..record.len(),
+        );
+        let (_, messages) = orch.process_frame(&frame, 4, &record, Duration::ZERO);
+        assert!(
+            messages.is_empty(),
+            "no message must ever be emitted for a permanently desynced direction"
+        );
+
+        let key = conn_key(CLIENT, SERVER);
+        let conn = orch
+            .connections
+            .get(&key)
+            .expect("connection must still exist");
+        assert!(conn.is_desynced(true));
+        assert_eq!(
+            conn.reassembler_c2s.contiguous_len(),
+            0,
+            "a desynced direction's reassembler must not accumulate anything at all, not even a \
+             well-formed record"
+        );
+        assert_eq!(conn.reassembler_c2s.pending_len(), 0);
     }
 
     /// Regression test for a real bug caught while verifying against real production pcaps:

@@ -69,6 +69,12 @@ impl LuaEngine {
         self.lua.used_memory()
     }
 
+    /// Forces a full Lua GC cycle -- see `Orchestrator::maybe_gc_lua`'s doc comment for why this
+    /// is called periodically instead of relying on Lua's own default incremental pacing.
+    pub fn gc_collect(&self) {
+        let _ = self.lua.gc_collect();
+    }
+
     /// Invokes the Lua dissector registered for `port` against `plaintext`, returning everything
     /// it recorded via `tree:add()`/`pinfo.cols`, plus how many leading bytes of `plaintext` it
     /// actually consumed (real Wireshark dissectors return this as their function's own return

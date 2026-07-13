@@ -123,7 +123,9 @@ tlscap -w <output-prefix> -e <field> [-e <field> ...] [--keylog <path>] [options
 | `--compress <gzip>` | | Compress rotated output chunks. `gzip` is the only supported value (matching `editcap`). |
 | `--idle-timeout-seconds <secs>` | `0` (disabled) | Evict a connection after this many idle seconds, **regardless of FIN/RST**. Leave disabled in production — see [Why](#why-this-exists-instead-of-just-using-tshark). |
 | `--max-pending-bytes <bytes>` | `4194304` | Per-(connection,direction) cap on out-of-order-buffered bytes before a gap is treated as abandoned (logged loudly, never silently). |
+| `--max-tail-bytes <bytes>` | `1048576` | Per-(connection,direction) cap on undissected tail bytes carried into the next record before they're truncated (logged loudly, never silently). Safety net for a registered dissector that doesn't consume much of what it's handed — a port with no dissector at all never accumulates a tail in the first place. |
 | `--stats-interval-seconds <secs>` | `60` | Log a `tlscap: stats ...` line this often: process RSS, active connections, bytes buffered in reassembly, keylog entry count, and running packet/message counters — for diagnosing gradual memory growth. `0` disables it. |
+| `--lua-gc-interval-seconds <secs>` | `5` | Force a full Lua GC cycle at most this often, as a low-cost safety net against Lua's own incremental collector falling behind under sustained high throughput. |
 
 With rotation, chunk files are named `<prefix>_NNNNNN_YYYYMMDDHHMMSS.gz`, matching `editcap`'s own
 naming convention.
@@ -325,23 +327,43 @@ self-consistent against `tlscap`'s own test fixtures.
     comment) -- the in-memory index grows with the *keylog file's* own size, which itself only
     ever grows for as long as the source JVM keeps logging new handshakes.
 
-  A real production replay found that `connections`/`keylog_entries`/Lua's own GC
-  heap can all stay completely flat while process RSS still climbs substantially under sustained
-  high throughput -- traced to allocator churn, not a logical leak. `--stats-interval-seconds`
-  ruled out the two by-design sources above; a local `--features dhat-heap` profile of the same
-  replay then found two independent hot allocation sites, together accounting for roughly 70% of
-  all bytes allocated: `dissect_and_emit`'s full clone of the reassembly buffer before every single
-  handoff to the Lua dissector (fixed by handing over a cheap `Rc` handle instead -- the Lua-side
-  `Tvb` already wraps its bytes in an `Rc`, so the caller can keep its own clone of the same handle
-  to slice the leftover tail back out afterward), and `ek_output.rs`'s `NdjsonWriter`/`EkWriter`
-  each building an independent scratch `Vec` per call and copying it out at the end instead of
-  writing straight into the caller's already-reused buffer (the same allocation-churn pattern
-  the v0.4.4 fix addressed one layer up, just recurring one layer deeper). Fixing both cut total
-  bytes allocated for an identical replay by 62% (measured, not estimated). Peak live memory at
-  any single instant was already small and essentially unchanged by either fix -- the problem was
-  always churn accumulating over a long-running process's lifetime, not a momentary spike.
-  `--features dhat-heap` (see `Cargo.toml`'s `[profile.dhat]`) is now a permanent, zero-cost-when-
-  disabled way to re-run this kind of investigation instead of reaching for an external profiler.
+  Two real, now-fixed bugs were found while chasing a production OOM:
+  - **A port with no registered dissector used to accumulate an unbounded tail.**
+    `dissect_and_emit`'s "no dissector for this port" path used to restore the *entire* buffer as
+    the connection's tail every single record, unconditionally -- for a connection with no
+    matching dissector, that meant accumulating every byte ever decrypted on it, for its whole
+    lifetime (confirmed reaching >1GB RSS this way on a real capture where the loaded dissector
+    didn't happen to match). Fixed: a port confirmed dissector-less (registration is 100% static,
+    done once at startup) never gets a tail retained at all now. A *registered* dissector that
+    doesn't consume much of what it's handed is still a real, if rarer, risk -- bounded now by
+    `--max-tail-bytes` (truncated and reported via a counter, never silently).
+  - **An unrecoverable reassembly gap used to leave a connection permanently, silently desynced.**
+    Once bytes are lost to a `GapAbandoned` gap, every subsequent byte is offset from the stream's
+    true TLS record boundaries. The record-length parser would keep trying anyway -- since a
+    claimed length can be up to 65535 bytes, that meant buffering up to ~64KB per bogus "record"
+    while decrypt permanently failed (`AuthFailed` spam) and no real message would ever come out
+    for that direction again, all invisibly. Fixed: a direction is marked desynced on its first
+    `GapAbandoned` event (logged loudly) and its reassembler stops accumulating anything for it at
+    all from then on.
+
+  Neither of these turned out to explain the original production OOM, though -- a real-capture
+  replay with the actual Lua dissector loaded (the mistake that led to finding the tail-growth bug
+  above in the first place: earlier local replays never loaded one, so *every* connection hit the
+  no-dissector path) showed **flat RSS for a full hour of real traffic, on the actual musl/Alpine
+  deployment target**, both before and after every fix in this section. Two allocation-churn fixes
+  in `dissect_and_emit` and `ek_output.rs` (avoiding a full buffer clone and a redundant per-call
+  scratch `Vec` respectively -- together cutting total bytes allocated by ~62% on a profiled
+  replay) are real and kept, but that measurement predates loading a real dissector too, so treat
+  it as "a legitimate reduction in allocator churn," not "the fix for the OOM." `mimalloc` (chosen
+  over musl's own allocator, which is known to fragment and hold onto freed pages) and a periodic
+  forced Lua GC cycle (`--lua-gc-interval-seconds`) are kept as low-cost safety nets for mechanisms
+  that are real in principle, not because either has been shown to matter in practice.
+
+  **The original OOM's root cause remains unconfirmed.** If you're chasing one, don't assume it's
+  any of the above -- watch `--stats-interval-seconds`'s real output in the actual failing
+  environment; a >1-hour-old local replay of a single task's traffic wasn't able to reproduce it.
+  `--features dhat-heap` (see `Cargo.toml`'s `[profile.dhat]`) is a permanent, zero-cost-when-
+  disabled way to profile allocations locally if a pattern does emerge.
 
 ## License
 

@@ -10,7 +10,7 @@ use tlscap::keylog_source::KeylogSource;
 use tlscap::lua::LuaEngine;
 use tlscap::orchestrator::{DecodedMessage, Orchestrator, OrchestratorConfig, PacketEvent};
 use tlscap::rotation::{RotateBy, RotatingGzWriter};
-use tlscap::{memstats, pcap_input, plugin_loader, reassembly};
+use tlscap::{memstats, orchestrator, pcap_input, plugin_loader, reassembly};
 
 /// A tshark-compatible, Lua-pluggable, TLS-decrypting live packet capture tool.
 ///
@@ -112,13 +112,46 @@ struct Cli {
     #[arg(long, default_value_t = reassembly::DEFAULT_MAX_PENDING_BYTES)]
     max_pending_bytes: usize,
 
+    /// Per-(connection,direction) cap on undissected tail bytes carried into the next record
+    /// before they're truncated (logged loudly, never silent -- see orchestrator.rs's
+    /// `Connection::tail_c2s`/`set_tail_capped`). A safety net for a registered dissector that
+    /// doesn't consume much of what it's handed; a port with no dissector at all never
+    /// accumulates a tail in the first place.
+    #[arg(long, default_value_t = orchestrator::DEFAULT_MAX_TAIL_BYTES)]
+    max_tail_bytes: usize,
+
     /// Log a memory/connection-tracking stats line every N seconds: process RSS, active
     /// connections, bytes buffered in reassembly, keylog entry count, and running packet/message
     /// counters. Helps diagnose gradual memory growth (e.g. an OOM-killed decode process) without
     /// an external profiler. 0 disables periodic stats logging.
     #[arg(long, default_value_t = 60)]
     stats_interval_seconds: u64,
+
+    /// Force a full Lua GC cycle at most this often. Lua's own incremental collector can fall
+    /// behind under sustained high throughput -- every dissected record creates GC-managed
+    /// userdata that keeps a multi-KB buffer alive via `Rc` until collected, and that buffer's
+    /// size isn't visible in `--stats-interval-seconds`'s `lua_mb` (which only reflects Lua's own
+    /// internal accounting). A short interval bounds how much can pile up regardless of
+    /// instantaneous traffic rate. Kept as a low-cost safety net for the mechanism it targets --
+    /// NOT because it's been shown to matter in practice (an earlier "measurably lowers RSS"
+    /// finding turned out to be an artifact of testing without a real dissector loaded; see
+    /// `OrchestratorConfig::lua_gc_interval`'s doc comment).
+    #[arg(long, default_value_t = 5)]
+    lua_gc_interval_seconds: u64,
 }
+
+// mimalloc rather than the platform default (musl's malloc, on the actual deployment target):
+// musl's allocator is known to fragment and hold onto freed pages rather than returning them to
+// the OS, which is exactly what turned "lots of small allocations of varying sizes, correctly
+// freed" into steadily climbing RSS over a long-running process's lifetime -- see
+// `orchestrator.rs::dissect_and_emit`'s and `ek_output.rs::CountingWriter`'s doc comments for the
+// allocation-churn sources that made this visible in the first place. Swapping the allocator is
+// the standard fix for this class of symptom (mimalloc/jemalloc actively compact and return
+// memory; musl's does not). Not used under `--features dhat-heap`, which needs to own the
+// `#[global_allocator]` slot itself to instrument allocations.
+#[cfg(not(feature = "dhat-heap"))]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -274,6 +307,8 @@ fn run(cli: Cli) -> io::Result<()> {
         idle_timeout,
         sweep_interval: Duration::from_secs(60),
         max_pending_bytes: cli.max_pending_bytes,
+        max_tail_bytes: cli.max_tail_bytes,
+        lua_gc_interval: Duration::from_secs(cli.lua_gc_interval_seconds),
     };
     let mut orchestrator = Orchestrator::new(keylog, lua, config);
 
@@ -379,12 +414,14 @@ fn run(cli: Cli) -> io::Result<()> {
         packet_output.finish()?;
     }
     eprintln!(
-        "tlscap: shutting down cleanly -- {} packets processed, {} messages written, {} packet events written, {} connections evicted, {} bytes lost to unrecoverable reassembly gaps, {} connections still active at exit",
+        "tlscap: shutting down cleanly -- {} packets processed, {} messages written, {} packet events written, {} connections evicted, {} bytes lost to unrecoverable reassembly gaps, {} connection direction(s) permanently desynced by a gap, {} tail bytes discarded for exceeding max_tail_bytes, {} connections still active at exit",
         packet_index,
         messages_written,
         packet_events_written,
         orchestrator.evicted_connections,
         orchestrator.gap_abandoned_bytes,
+        orchestrator.connections_desynced,
+        orchestrator.tail_bytes_discarded,
         orchestrator.active_connections(),
     );
     eprintln!(
@@ -413,7 +450,7 @@ fn log_stats(
 ) {
     let rss_mb = memstats::rss_bytes().map(|b| b / (1024 * 1024));
     eprintln!(
-        "tlscap: stats rss_mb={} lua_mb={} connections={} buffered_bytes={} keylog_entries={} packets={} messages={} packet_events={} evicted={} gap_abandoned_bytes={}",
+        "tlscap: stats rss_mb={} lua_mb={} connections={} buffered_bytes={} keylog_entries={} packets={} messages={} packet_events={} evicted={} gap_abandoned_bytes={} connections_desynced={} tail_bytes_discarded={}",
         rss_mb
             .map(|mb| mb.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
@@ -426,5 +463,7 @@ fn log_stats(
         packet_events_written,
         orchestrator.evicted_connections,
         orchestrator.gap_abandoned_bytes,
+        orchestrator.connections_desynced,
+        orchestrator.tail_bytes_discarded,
     );
 }
