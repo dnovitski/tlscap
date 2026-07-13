@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use flate2::Compression;
 
 use tlscap::ek_output::{EkWriter, NdjsonWriter};
 use tlscap::keylog::Keylog;
@@ -98,6 +99,15 @@ struct Cli {
     /// Compression for file output. `gzip` is the only supported value (matching editcap).
     #[arg(long)]
     compress: Option<String>,
+
+    /// gzip compression level, 0 (no compression) through 9 (max) -- default matches zlib's own
+    /// default (6). CPU spent compressing in a live-capture pipeline is CPU not spent draining
+    /// tcpdump's own kernel capture buffer promptly; that buffer overflowing under sustained high
+    /// throughput is a real, observed source of packet loss (visible as "N packets dropped by
+    /// kernel" in tcpdump's own exit summary). Lowering this trades some output size for freeing
+    /// up CPU across the whole task during exactly the traffic bursts when it matters most.
+    #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(0..=9))]
+    compress_level: u32,
 
     /// Evict a connection after this many seconds of inactivity, REGARDLESS of FIN/RST state.
     /// Off (0) by default and deliberately so: production guidance is to leave this disabled so
@@ -207,11 +217,15 @@ enum Output {
 }
 
 impl Output {
-    fn new(prefix: &str, rotate_by: RotateBy) -> Self {
+    fn new(prefix: &str, rotate_by: RotateBy, compression: Compression) -> Self {
         if prefix == "-" {
             Output::Stdout
         } else {
-            Output::Rotating(RotatingGzWriter::new(PathBuf::from(prefix), rotate_by))
+            Output::Rotating(RotatingGzWriter::with_compression(
+                PathBuf::from(prefix),
+                rotate_by,
+                compression,
+            ))
         }
     }
 
@@ -331,11 +345,12 @@ fn run(cli: Cli) -> io::Result<()> {
         (None, None) => RotateBy::Never,
         (Some(_), Some(_)) => unreachable!("validated mutually exclusive above"),
     };
-    let mut output = Output::new(&cli.output, rotate_by);
+    let compression = Compression::new(cli.compress_level);
+    let mut output = Output::new(&cli.output, rotate_by, compression);
     let mut packet_output = cli
         .packet_log
         .as_deref()
-        .map(|prefix| Output::new(prefix, rotate_by));
+        .map(|prefix| Output::new(prefix, rotate_by, compression));
 
     let stdin = io::stdin();
     let mut source = match pcap_input::open(stdin.lock()) {

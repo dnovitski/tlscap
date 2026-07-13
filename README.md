@@ -121,6 +121,7 @@ tlscap -w <output-prefix> -e <field> [-e <field> ...] [--keylog <path>] [options
 | `-c <count>` | | Rotate output after this many dissected messages. Mutually exclusive with `-i`. Governs both `-w` and `--packet-log`. |
 | `-i <seconds>` | | Rotate output after this many seconds. Mutually exclusive with `-c`. Governs both `-w` and `--packet-log`. |
 | `--compress <gzip>` | | Compress rotated output chunks. `gzip` is the only supported value (matching `editcap`). |
+| `--compress-level <0-9>` | `6` | gzip compression level (0 = none, 9 = max, 6 = zlib's own default). Unlike `editcap` (no level control at all), this is tunable — worth lowering in a live-capture pipeline where CPU spent compressing competes with `tcpdump`'s own need to drain its kernel capture buffer promptly. |
 | `--idle-timeout-seconds <secs>` | `0` (disabled) | Evict a connection after this many idle seconds, **regardless of FIN/RST**. Leave disabled in production — see [Why](#why-this-exists-instead-of-just-using-tshark). |
 | `--max-pending-bytes <bytes>` | `4194304` | Per-(connection,direction) cap on out-of-order-buffered bytes before a gap is treated as abandoned (logged loudly, never silently). |
 | `--max-tail-bytes <bytes>` | `1048576` | Per-(connection,direction) cap on undissected tail bytes carried into the next record before they're truncated (logged loudly, never silently). Safety net for a registered dissector that doesn't consume much of what it's handed — a port with no dissector at all never accumulates a tail in the first place. |

@@ -35,6 +35,7 @@ pub enum RotateBy {
 pub struct RotatingGzWriter {
     prefix: PathBuf,
     rotate_by: RotateBy,
+    compression: Compression,
     current: Option<CurrentChunk>,
     chunk_counter: u64,
 }
@@ -48,9 +49,24 @@ struct CurrentChunk {
 
 impl RotatingGzWriter {
     pub fn new(prefix: PathBuf, rotate_by: RotateBy) -> Self {
+        Self::with_compression(prefix, rotate_by, Compression::default())
+    }
+
+    /// Like `new`, but with an explicit gzip compression level -- see `--compress-level`'s doc
+    /// comment in `main.rs` for why this is worth tuning down from the default in a live-capture
+    /// pipeline: CPU spent compressing is CPU not spent draining tcpdump's own kernel capture
+    /// buffer promptly, and that buffer overflowing is a real, observed source of packet loss
+    /// under sustained high throughput (unlike editcap, which hardcodes its own gzip level with
+    /// no CLI control at all -- this is tlscap's one advantage there).
+    pub fn with_compression(
+        prefix: PathBuf,
+        rotate_by: RotateBy,
+        compression: Compression,
+    ) -> Self {
         RotatingGzWriter {
             prefix,
             rotate_by,
+            compression,
             current: None,
             chunk_counter: 0,
         }
@@ -88,7 +104,7 @@ impl RotatingGzWriter {
         self.chunk_counter += 1;
         let path = chunk_path(&self.prefix, self.chunk_counter, now_stamp());
         let file = File::create(&path)?;
-        let encoder = GzEncoder::new(file, Compression::default());
+        let encoder = GzEncoder::new(file, self.compression);
         self.current = Some(CurrentChunk {
             encoder,
             path,

@@ -1382,7 +1382,7 @@ dependencies = [
 
 [[package]]
 name = "tlscap"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
