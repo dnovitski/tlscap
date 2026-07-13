@@ -120,7 +120,14 @@ struct Cli {
     stats_interval_seconds: u64,
 }
 
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 fn main() {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     let cli = Cli::parse();
 
     if cli.rotate_count.is_some() && cli.rotate_seconds.is_some() {

@@ -327,10 +327,21 @@ self-consistent against `tlscap`'s own test fixtures.
 
   A real production replay found that `connections`/`keylog_entries`/Lua's own GC
   heap can all stay completely flat while process RSS still climbs substantially under sustained
-  high throughput -- traced to allocator churn from a fresh heap allocation on every single
-  message/packet-event write (fixed in v0.4.4 by reusing one scratch buffer), which measurably
-  slowed the growth but did not eliminate it. The remainder is unexplained; pin down further with
-  a real heap profiler (e.g. `heaptrack`, `valgrind --tool=massif`) rather than guessing again.
+  high throughput -- traced to allocator churn, not a logical leak. `--stats-interval-seconds`
+  ruled out the two by-design sources above; a local `--features dhat-heap` profile of the same
+  replay then found two independent hot allocation sites, together accounting for roughly 70% of
+  all bytes allocated: `dissect_and_emit`'s full clone of the reassembly buffer before every single
+  handoff to the Lua dissector (fixed by handing over a cheap `Rc` handle instead -- the Lua-side
+  `Tvb` already wraps its bytes in an `Rc`, so the caller can keep its own clone of the same handle
+  to slice the leftover tail back out afterward), and `ek_output.rs`'s `NdjsonWriter`/`EkWriter`
+  each building an independent scratch `Vec` per call and copying it out at the end instead of
+  writing straight into the caller's already-reused buffer (the same allocation-churn pattern
+  the v0.4.4 fix addressed one layer up, just recurring one layer deeper). Fixing both cut total
+  bytes allocated for an identical replay by 62% (measured, not estimated). Peak live memory at
+  any single instant was already small and essentially unchanged by either fix -- the problem was
+  always churn accumulating over a long-running process's lifetime, not a momentary spike.
+  `--features dhat-heap` (see `Cargo.toml`'s `[profile.dhat]`) is now a permanent, zero-cost-when-
+  disabled way to re-run this kind of investigation instead of reaching for an external profiler.
 
 ## License
 

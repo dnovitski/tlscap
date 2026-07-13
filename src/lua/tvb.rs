@@ -14,10 +14,13 @@ pub struct Tvb {
 }
 
 impl Tvb {
-    pub fn new(data: Vec<u8>) -> Self {
-        Self {
-            data: Rc::new(data),
-        }
+    /// Takes an `Rc` handle rather than an owned `Vec` so a caller that still needs the same
+    /// bytes afterward (e.g. to slice out an undissected tail once dissection finishes) can keep
+    /// its own cheap clone of the handle instead of paying for an independent full-buffer copy up
+    /// front -- this used to be the single largest source of allocator churn in the whole process
+    /// at real production throughput (see `orchestrator.rs::dissect_and_emit`'s doc comment).
+    pub fn new(data: Rc<Vec<u8>>) -> Self {
+        Self { data }
     }
 }
 

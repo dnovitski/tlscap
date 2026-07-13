@@ -80,7 +80,7 @@ impl LuaEngine {
     pub fn dissect(
         &self,
         port: u16,
-        plaintext: Vec<u8>,
+        plaintext: Rc<Vec<u8>>,
     ) -> LuaResult<Option<(FrameFields, usize)>> {
         let proto_table = match self.tls_port_registry.borrow().get(&port) {
             Some(t) => t.clone(),
@@ -182,7 +182,7 @@ mod tests {
             .unwrap();
 
         // kind=7 (1 byte), name="ABCD" (4 bytes), marker=0x0102 little-endian (2 bytes)
-        let plaintext = vec![7u8, b'A', b'B', b'C', b'D', 0x02, 0x01];
+        let plaintext = std::rc::Rc::new(vec![7u8, b'A', b'B', b'C', b'D', 0x02, 0x01]);
         let (result, consumed) = engine
             .dissect(4242, plaintext)
             .unwrap()
@@ -231,7 +231,10 @@ mod tests {
             DissectorTable.get("tls.port"):add(7777, proto)
         "#;
         engine.load_plugin_str(partial, "partial.lua").unwrap();
-        let (_, consumed) = engine.dissect(7777, vec![1, 2, 3, 4, 5]).unwrap().unwrap();
+        let (_, consumed) = engine
+            .dissect(7777, std::rc::Rc::new(vec![1, 2, 3, 4, 5]))
+            .unwrap()
+            .unwrap();
         assert_eq!(consumed, 3);
     }
 
@@ -241,7 +244,12 @@ mod tests {
         engine
             .load_plugin_str(FIXTURE_DISSECTOR, "fixture.lua")
             .unwrap();
-        assert!(engine.dissect(9999, vec![1, 2, 3]).unwrap().is_none());
+        assert!(
+            engine
+                .dissect(9999, std::rc::Rc::new(vec![1, 2, 3]))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -266,12 +274,18 @@ mod tests {
         assert!(engine.has_dissector_for_port(5555));
 
         let (r1, _) = engine
-            .dissect(4242, vec![1, b'W', b'X', b'Y', b'Z', 0, 0])
+            .dissect(
+                4242,
+                std::rc::Rc::new(vec![1, b'W', b'X', b'Y', b'Z', 0, 0]),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(r1.values_for("fixture.kind"), vec![FieldValue::UInt(1)]);
 
-        let (r2, _) = engine.dissect(5555, b"hi".to_vec()).unwrap().unwrap();
+        let (r2, _) = engine
+            .dissect(5555, std::rc::Rc::new(b"hi".to_vec()))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             r2.entries,
             vec![(
@@ -322,7 +336,7 @@ mod tests {
         "#;
         engine.load_plugin_str(nested, "nested.lua").unwrap();
 
-        let plaintext = vec![0xAA, 0xBB, 10, 20, 30, 40, 0xCC];
+        let plaintext = std::rc::Rc::new(vec![0xAA, 0xBB, 10, 20, 30, 40, 0xCC]);
         let (result, _) = engine
             .dissect(3333, plaintext)
             .unwrap()
@@ -356,7 +370,10 @@ mod tests {
         "#;
         engine.load_plugin_str(nested, "nested.lua").unwrap();
 
-        let (result, _) = engine.dissect(2222, vec![10, 20]).unwrap().unwrap();
+        let (result, _) = engine
+            .dissect(2222, std::rc::Rc::new(vec![10, 20]))
+            .unwrap()
+            .unwrap();
 
         // Top level: the direct `f_a` add, plus one nested "outer" subtree -- not three flat
         // entries.
@@ -403,7 +420,10 @@ mod tests {
         "#;
         engine.load_plugin_str(looping, "looping.lua").unwrap();
 
-        let (result, _) = engine.dissect(1111, vec![10, 20, 30]).unwrap().unwrap();
+        let (result, _) = engine
+            .dissect(1111, std::rc::Rc::new(vec![10, 20, 30]))
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.entries.len(), 3, "one Tree entry per loop iteration");
         for (name, value) in &result.entries {

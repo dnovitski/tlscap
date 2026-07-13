@@ -1,6 +1,6 @@
 [package]
 name = "tlscap"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2024"
 description = "A tshark-compatible, Lua-pluggable, TLS-decrypting live packet capture tool"
 license = "MIT"
@@ -23,6 +23,10 @@ hkdf = "0.13.0"
 hmac = "0.13.0"
 sha2 = "0.11.0"
 hex = "0.4.3"
+dhat = { version = "0.3", optional = true }
+
+[features]
+dhat-heap = ["dep:dhat"]
 
 [dev-dependencies]
 rcgen = "0.14.8"
@@ -31,3 +35,9 @@ rustls = "0.23.41"
 [profile.release]
 strip = true
 lto = true
+
+[profile.dhat]
+inherits = "release"
+strip = false
+lto = false
+debug = true

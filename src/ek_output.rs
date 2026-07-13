@@ -22,6 +22,31 @@ use std::io::{self, Write};
 use crate::lua::{FieldValue, FrameFields};
 use crate::orchestrator::{DecodedMessage, PacketEvent};
 
+/// Forwards every write to `inner` while counting the bytes that pass through -- lets
+/// `write_message`/`write_one_tls_record`/`write_packet_event` format field-by-field directly
+/// into the caller's own (already-reused) buffer instead of building an independent scratch `Vec`
+/// per call and copying it out at the end, while still reporting how many bytes were written. That
+/// per-call scratch `Vec` used to be the second-largest source of allocator churn in the whole
+/// process at real production throughput, right behind `orchestrator.rs::dissect_and_emit`'s own
+/// (since-fixed) full-buffer clone -- both found via a local dhat-profiled replay of a real
+/// capture, not guessed.
+struct CountingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    count: usize,
+}
+
+impl<W: Write> Write for CountingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 pub struct EkWriter {
     fields: Vec<String>,
     index_prefix: String,
@@ -40,17 +65,17 @@ impl EkWriter {
     /// Writes one message's two-line NDJSON entry. Returns the number of bytes written, so
     /// `rotation.rs` can track output-chunk size without a second pass.
     pub fn write_message<W: Write>(&self, w: &mut W, msg: &DecodedMessage) -> io::Result<usize> {
-        let mut buf = Vec::new();
+        let mut w = CountingWriter { inner: w, count: 0 };
 
         writeln!(
-            buf,
+            w,
             "{{\"index\":{{\"_index\":\"{}-{}\"}}}}",
             self.index_prefix,
             index_date(msg.timestamp)
         )?;
 
         write!(
-            buf,
+            w,
             "{{\"timestamp\":\"{}\",\"layers\":{{",
             epoch_millis(msg.timestamp)
         )?;
@@ -63,24 +88,22 @@ impl EkWriter {
                 continue;
             }
             if !first {
-                buf.push(b',');
+                w.write_all(b",")?;
             }
             first = false;
-            write_json_string(&mut buf, &field.replace('.', "_"))?;
-            buf.push(b':');
-            buf.push(b'[');
+            write_json_string(&mut w, &field.replace('.', "_"))?;
+            w.write_all(b":[")?;
             for (i, v) in values.iter().enumerate() {
                 if i > 0 {
-                    buf.push(b',');
+                    w.write_all(b",")?;
                 }
-                write_json_string(&mut buf, v)?;
+                write_json_string(&mut w, v)?;
             }
-            buf.push(b']');
+            w.write_all(b"]")?;
         }
-        writeln!(buf, "}}}}")?;
+        writeln!(w, "}}}}")?;
 
-        w.write_all(&buf)?;
-        Ok(buf.len())
+        Ok(w.count)
     }
 
     /// Resolves one `-e` field name against a message's built-in envelope fields (`ip.src`,
@@ -243,77 +266,73 @@ impl NdjsonWriter {
         grouped: &[(&str, Vec<&FieldValue>)],
         exploded: Option<(&str, &FieldValue)>,
     ) -> io::Result<usize> {
-        let mut buf = Vec::new();
-        self.write_preamble(&mut buf, "tls_record", msg.timestamp)?;
-        self.write_ip(&mut buf, &msg.src_ip.to_string(), &msg.dst_ip.to_string())?;
+        let mut w = CountingWriter { inner: w, count: 0 };
+        self.write_preamble(&mut w, "tls_record", msg.timestamp)?;
+        self.write_ip(&mut w, &msg.src_ip.to_string(), &msg.dst_ip.to_string())?;
         if self.groups.contains("tcp") {
             write!(
-                &mut buf,
+                w,
                 ",\"tcp\":{{\"srcport\":{},\"dstport\":{}}}",
                 msg.src_port, msg.dst_port
             )?;
         }
         if self.groups.contains("tls") {
-            buf.extend_from_slice(b",\"tls\":{\"app_data\":");
-            write_json_string(&mut buf, &hex::encode(&msg.tls_app_data))?;
-            buf.push(b'}');
+            w.write_all(b",\"tls\":{\"app_data\":")?;
+            write_json_string(&mut w, &hex::encode(&msg.tls_app_data))?;
+            w.write_all(b"}")?;
         }
         for group in &self.generic_group_order {
             if let Some((exploded_name, single_value)) = exploded
                 && group == exploded_name
             {
-                buf.push(b',');
-                write_json_string(&mut buf, group)?;
-                buf.push(b':');
-                write_field_value(&mut buf, single_value, group, &self.map_fields)?;
+                w.write_all(b",")?;
+                write_json_string(&mut w, group)?;
+                w.write_all(b":")?;
+                write_field_value(&mut w, single_value, group, &self.map_fields)?;
                 continue;
             }
             let Some(values) = grouped.iter().find(|(n, _)| n == group).map(|(_, v)| v) else {
                 continue;
             };
-            buf.push(b',');
-            write_json_string(&mut buf, group)?;
-            buf.push(b':');
-            write_named_value(&mut buf, group, values, group, &self.map_fields)?;
+            w.write_all(b",")?;
+            write_json_string(&mut w, group)?;
+            w.write_all(b":")?;
+            write_named_value(&mut w, group, values, group, &self.map_fields)?;
         }
-        buf.push(b'}');
-        buf.push(b'\n');
+        w.write_all(b"}\n")?;
 
-        w.write_all(&buf)?;
-        Ok(buf.len())
+        Ok(w.count)
     }
 
     /// Writes one raw TCP frame's own header-level event. Returns bytes written, same reasoning as
     /// `write_tls_record`.
     pub fn write_packet_event<W: Write>(&self, w: &mut W, evt: &PacketEvent) -> io::Result<usize> {
-        let mut buf = Vec::new();
-        self.write_preamble(&mut buf, "packet", evt.timestamp)?;
-        self.write_ip(&mut buf, &evt.src_ip.to_string(), &evt.dst_ip.to_string())?;
+        let mut w = CountingWriter { inner: w, count: 0 };
+        self.write_preamble(&mut w, "packet", evt.timestamp)?;
+        self.write_ip(&mut w, &evt.src_ip.to_string(), &evt.dst_ip.to_string())?;
         if self.groups.contains("tcp") {
-            buf.extend_from_slice(b",\"tcp\":{\"srcport\":");
-            write!(&mut buf, "{}", evt.src_port)?;
-            buf.extend_from_slice(b",\"dstport\":");
-            write!(&mut buf, "{}", evt.dst_port)?;
-            buf.extend_from_slice(b",\"seq\":");
-            write!(&mut buf, "{}", evt.seq)?;
-            buf.extend_from_slice(b",\"ack\":");
-            write!(&mut buf, "{}", evt.ack)?;
-            buf.extend_from_slice(b",\"flags\":[");
+            w.write_all(b",\"tcp\":{\"srcport\":")?;
+            write!(w, "{}", evt.src_port)?;
+            w.write_all(b",\"dstport\":")?;
+            write!(w, "{}", evt.dst_port)?;
+            w.write_all(b",\"seq\":")?;
+            write!(w, "{}", evt.seq)?;
+            w.write_all(b",\"ack\":")?;
+            write!(w, "{}", evt.ack)?;
+            w.write_all(b",\"flags\":[")?;
             for (i, flag) in evt.flags.iter().enumerate() {
                 if i > 0 {
-                    buf.push(b',');
+                    w.write_all(b",")?;
                 }
-                write_json_string(&mut buf, flag)?;
+                write_json_string(&mut w, flag)?;
             }
-            buf.extend_from_slice(b"],\"payload_len\":");
-            write!(&mut buf, "{}", evt.payload_len)?;
-            buf.push(b'}');
+            w.write_all(b"],\"payload_len\":")?;
+            write!(w, "{}", evt.payload_len)?;
+            w.write_all(b"}")?;
         }
-        buf.push(b'}');
-        buf.push(b'\n');
+        w.write_all(b"}\n")?;
 
-        w.write_all(&buf)?;
-        Ok(buf.len())
+        Ok(w.count)
     }
 }
 

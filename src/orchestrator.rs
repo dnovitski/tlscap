@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::connection::{self, ConnectionState};
@@ -544,9 +545,12 @@ impl Orchestrator {
         let mut buf = conn.take_tail(is_client_to_server);
         buf.extend_from_slice(&plaintext);
 
-        // dissect() takes ownership of the buffer (it becomes the Lua-side Tvb) -- keep a cheap
-        // clone so the undissected tail can be sliced back out afterward without needing dissect()
-        // itself to hand bytes back.
+        // dissect() only needs a cheap `Rc` handle -- the Lua-side Tvb already wraps its bytes in
+        // an `Rc<Vec<u8>>` (see tvb.rs) -- so keeping our own clone of that handle lets the
+        // undissected tail be sliced back out afterward without paying for an independent
+        // full-buffer copy on every single decrypted record. This used to be the single largest
+        // source of allocator churn in the whole process at real production throughput (~50% of
+        // all bytes allocated in a local dhat-profiled replay of a real capture).
         let (src, dst) = conn.endpoints(is_client_to_server);
         // The dissector-table port lookup is always the SERVER's well-known port (e.g. 9410),
         // regardless of message direction -- NOT simply "this record's dst port", which is only
@@ -556,12 +560,12 @@ impl Orchestrator {
         // *_RESPONSE messages were 100% missing from output while *_REQUEST messages decoded
         // almost perfectly -- exactly the signature of this direction-blind bug).
         let port = conn.server_endpoint.1;
-        let buf_for_dissect = buf.clone();
+        let buf = Rc::new(buf);
         let tls_app_data = plaintext;
 
         let mut fields = FrameFields::default();
 
-        match self.lua.dissect(port, buf_for_dissect) {
+        match self.lua.dissect(port, buf.clone()) {
             Ok(Some((mut dissected, consumed))) => {
                 let leftover = buf[consumed.min(buf.len())..].to_vec();
                 if let Some(conn) = self.connections.get_mut(key) {
@@ -578,14 +582,25 @@ impl Orchestrator {
                 // gets registered later is out of scope for v1, but at minimum this must not
                 // silently drop bytes: put them back so a future record's decrypt at least keeps
                 // them available for inspection via --verify-reassembly-style accounting.
+                // `try_unwrap` reliably succeeds here (dissect() returned before ever creating a
+                // Tvb, so our clone above is the only other handle) -- the `unwrap_or_else` clone
+                // fallback exists only for `Err(e)` below, where a Tvb's GC-managed userdata may
+                // still be holding a live handle (same reasoning as `dissect()`'s own `fields` Rc
+                // -- see lua/mod.rs's doc comment).
                 if let Some(conn) = self.connections.get_mut(key) {
-                    conn.set_tail(is_client_to_server, buf);
+                    conn.set_tail(
+                        is_client_to_server,
+                        Rc::try_unwrap(buf).unwrap_or_else(|rc| (*rc).clone()),
+                    );
                 }
             }
             Err(e) => {
                 eprintln!("tlscap: WARNING Lua dissector error on port {port}: {e}");
                 if let Some(conn) = self.connections.get_mut(key) {
-                    conn.set_tail(is_client_to_server, buf);
+                    conn.set_tail(
+                        is_client_to_server,
+                        Rc::try_unwrap(buf).unwrap_or_else(|rc| (*rc).clone()),
+                    );
                 }
             }
         }
