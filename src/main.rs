@@ -118,9 +118,25 @@ struct Cli {
     idle_timeout_seconds: u64,
 
     /// Per-(connection,direction) cap on out-of-order-buffered bytes before a gap is treated as
-    /// abandoned (logged loudly, never silent -- see reassembly.rs).
+    /// abandoned (logged loudly, never silent -- see reassembly.rs). Protects against a single
+    /// large permanent gap; see `--max-pending-packets`/`--max-pending-age-seconds` for the other
+    /// two independent limits that protect against permanent gaps too small to ever trip this one.
     #[arg(long, default_value_t = reassembly::DEFAULT_MAX_PENDING_BYTES)]
     max_pending_bytes: usize,
+
+    /// Per-(connection,direction) cap on the number of out-of-order segments buffered before a
+    /// gap is treated as abandoned (see `PendingLimits::max_packets` in reassembly.rs) -- catches
+    /// busy connections whose permanent gap accumulates many small segments long before
+    /// `--max-pending-bytes` would ever trip.
+    #[arg(long, default_value_t = reassembly::DEFAULT_MAX_PENDING_PACKETS)]
+    max_pending_packets: usize,
+
+    /// Per-(connection,direction) age limit, in seconds, on how long a gap may stay open before
+    /// it's treated as abandoned (see `PendingLimits::max_age` in reassembly.rs) -- catches
+    /// low-traffic connections whose permanent gap never accumulates enough bytes or packets to
+    /// trip either of the other two limits.
+    #[arg(long, default_value_t = reassembly::DEFAULT_MAX_PENDING_AGE.as_secs())]
+    max_pending_age_seconds: u64,
 
     /// Per-(connection,direction) cap on undissected tail bytes carried into the next record
     /// before they're truncated (logged loudly, never silent -- see orchestrator.rs's
@@ -321,6 +337,8 @@ fn run(cli: Cli) -> io::Result<()> {
         idle_timeout,
         sweep_interval: Duration::from_secs(60),
         max_pending_bytes: cli.max_pending_bytes,
+        max_pending_packets: cli.max_pending_packets,
+        max_pending_age: Duration::from_secs(cli.max_pending_age_seconds),
         max_tail_bytes: cli.max_tail_bytes,
         lua_gc_interval: Duration::from_secs(cli.lua_gc_interval_seconds),
     };

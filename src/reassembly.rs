@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 /// One still-unconsumed slice of reassembled bytes, tagged with where it came from in the
 /// original capture (packet index + byte range within that packet), mirroring
@@ -40,12 +41,60 @@ pub enum PushOutcome {
     /// The segment (or its trimmed tail) starts after the next-expected byte -- a genuine gap.
     /// Buffered in `pending`; will drain into `contiguous` once the gap closes.
     BufferedOutOfOrder,
-    /// `pending` exceeded `max_pending_bytes`; the oldest pending segment(s) were evicted to make
-    /// room. This is the one case where bytes are genuinely, unrecoverably lost -- always
-    /// reported, never silent. Typically means the segment that would have closed this gap was
-    /// never captured at all (real upstream packet loss), which no reassembler can recover from.
+    /// `pending` hit one of `PendingLimits`' three caps -- see its own doc comment for why there
+    /// are three, not one. Some pending data was evicted to bring it back under whichever limit
+    /// tripped (byte/packet caps: the oldest entries, until back under; the age cap: the whole
+    /// thing at once, since trimming a few entries wouldn't make the remaining ones any younger).
+    /// This is the one case where bytes are genuinely, unrecoverably lost -- always reported,
+    /// never silent. Typically means the segment that would have closed this gap was never
+    /// captured at all (real upstream packet loss), which no reassembler can recover from.
     GapAbandoned { bytes: usize },
 }
+
+/// Bounds on how much -- and how long -- a `StreamReassembler` will buffer out-of-order data
+/// before giving up on the underlying gap ever closing (`PushOutcome::GapAbandoned`). Whichever
+/// limit is hit first wins; each guards against a different shape of failure a single limit can't
+/// cover alone:
+/// - `max_bytes` alone lets a genuine, permanent gap (the segment that would close it was never
+///   captured -- confirmed in production via real "N packets dropped by kernel" tcpdump exit
+///   summaries reaching into the hundreds of thousands) sit forever on a connection whose
+///   subsequent traffic happens to stay just under the cap -- observed directly causing a real
+///   production OOM (RSS climbing in lockstep with a connection's own `pending_len`, confirmed via
+///   `--stats-interval-seconds` right up to the kernel's SIGKILL).
+/// - `max_packets` catches that case far sooner for a busy connection: legitimate brief reordering
+///   (e.g. from Linux's "any" cooked-capture interface reordering under load, see this module's
+///   own header comment) resolves within a handful of segments: one real round-trip. A gap still
+///   open after dozens of segments is not "still reordering," it is permanent.
+/// - `max_age` catches what `max_packets` can't: a low-traffic connection with a permanent gap
+///   might take a very long time to accumulate enough *packets* to trip that limit, all while
+///   quietly holding the gap open indefinitely. Age doesn't care how much or how little arrived in
+///   the meantime.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingLimits {
+    pub max_bytes: usize,
+    pub max_packets: usize,
+    pub max_age: Duration,
+}
+
+impl Default for PendingLimits {
+    fn default() -> Self {
+        PendingLimits {
+            max_bytes: DEFAULT_MAX_PENDING_BYTES,
+            max_packets: DEFAULT_MAX_PENDING_PACKETS,
+            max_age: DEFAULT_MAX_PENDING_AGE,
+        }
+    }
+}
+
+/// Generous relative to a single TLS record (max 16KB + 5-byte header), sized to tolerate several
+/// records' worth of reordering before treating a gap as abandoned. See `PendingLimits`'s own doc
+/// comment for why this alone isn't sufficient.
+pub const DEFAULT_MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
+/// Generous relative to how many segments legitimate brief reordering ever involves (usually a
+/// handful); see `PendingLimits`'s own doc comment.
+pub const DEFAULT_MAX_PENDING_PACKETS: usize = 50;
+/// See `PendingLimits`'s own doc comment.
+pub const DEFAULT_MAX_PENDING_AGE: Duration = Duration::from_secs(30);
 
 /// Reassembles one direction of a TCP stream. Construct one instance per (connection, direction).
 pub struct StreamReassembler {
@@ -55,20 +104,27 @@ pub struct StreamReassembler {
     contiguous_len: usize,
     pending: BTreeMap<u64, Segment>,
     pending_len: usize,
-    max_pending_bytes: usize,
+    limits: PendingLimits,
+    /// When `pending` most recently transitioned from empty to non-empty -- i.e. when the
+    /// currently-open gap first appeared. `None` whenever `pending` is empty. Powers the
+    /// `max_age` limit; reset (not just left stale) every time the gap fully closes, so a brand
+    /// new gap opening later gets its own fresh clock rather than inheriting an old timestamp.
+    pending_since: Option<Instant>,
 }
-
-/// A default cap on out-of-order-buffered bytes per direction. Generous relative to a single TLS
-/// record (max 16KB + 5-byte header), sized to tolerate several records' worth of reordering
-/// before treating a gap as abandoned.
-pub const DEFAULT_MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
 
 impl StreamReassembler {
     pub fn new() -> Self {
-        Self::with_max_pending_bytes(DEFAULT_MAX_PENDING_BYTES)
+        Self::with_pending_limits(PendingLimits::default())
     }
 
     pub fn with_max_pending_bytes(max_pending_bytes: usize) -> Self {
+        Self::with_pending_limits(PendingLimits {
+            max_bytes: max_pending_bytes,
+            ..PendingLimits::default()
+        })
+    }
+
+    pub fn with_pending_limits(limits: PendingLimits) -> Self {
         Self {
             base_seq: None,
             next_expected_relative: 0,
@@ -76,7 +132,8 @@ impl StreamReassembler {
             contiguous_len: 0,
             pending: BTreeMap::new(),
             pending_len: 0,
-            max_pending_bytes,
+            limits,
+            pending_since: None,
         }
     }
 
@@ -201,6 +258,11 @@ impl StreamReassembler {
             self.pending_len -= seg.data.len();
             self.deliver(seg);
         }
+        if self.pending.is_empty() {
+            // The gap fully closed -- reset the clock so a brand new gap opening later gets its
+            // own fresh `pending_since` rather than inheriting this one's age.
+            self.pending_since = None;
+        }
     }
 
     fn buffer_pending(&mut self, rel: u64, seg: Segment) -> PushOutcome {
@@ -215,23 +277,51 @@ impl StreamReassembler {
             self.pending_len -= existing.data.len();
         }
 
+        if self.pending.is_empty() {
+            self.pending_since = Some(Instant::now());
+        }
         self.pending.insert(rel, seg);
         self.pending_len += incoming_len;
 
-        if self.pending_len <= self.max_pending_bytes {
+        let age_exceeded = self
+            .pending_since
+            .is_some_and(|since| since.elapsed() > self.limits.max_age);
+
+        if self.pending_len <= self.limits.max_bytes
+            && self.pending.len() <= self.limits.max_packets
+            && !age_exceeded
+        {
             return PushOutcome::BufferedOutOfOrder;
         }
 
-        // Over budget: evict the oldest (lowest-sequence) pending segments until back under the
-        // cap. These bytes are genuinely, unrecoverably lost -- report exactly how many.
+        if age_exceeded {
+            // Trimming a few entries wouldn't make the remaining ones any younger -- the gap has
+            // been open too long regardless of size, so give up on all of it at once.
+            let evicted_bytes = self.pending_len;
+            self.pending.clear();
+            self.pending_len = 0;
+            self.pending_since = None;
+            return PushOutcome::GapAbandoned {
+                bytes: evicted_bytes,
+            };
+        }
+
+        // Over budget on bytes and/or packet count: evict the oldest (lowest-sequence) pending
+        // segments until back under both caps. These bytes are genuinely, unrecoverably lost --
+        // report exactly how many.
         let mut evicted_bytes = 0usize;
-        while self.pending_len > self.max_pending_bytes {
+        while self.pending_len > self.limits.max_bytes
+            || self.pending.len() > self.limits.max_packets
+        {
             let Some((&oldest_key, _)) = self.pending.iter().next() else {
                 break;
             };
             let removed = self.pending.remove(&oldest_key).unwrap();
             self.pending_len -= removed.data.len();
             evicted_bytes += removed.data.len();
+        }
+        if self.pending.is_empty() {
+            self.pending_since = None;
         }
         PushOutcome::GapAbandoned {
             bytes: evicted_bytes,
@@ -432,6 +522,69 @@ mod tests {
         // The oldest pending entry (the first 6 'x' bytes) was evicted to make room; the newest
         // segment survives in pending.
         assert_eq!(r.pending_len(), 6);
+    }
+
+    /// Regression test for a real production OOM: a connection whose subsequent traffic never
+    /// happens to exceed max_pending_bytes can sit with a permanent gap forever, since byte count
+    /// alone never trips. Confirmed via real --stats-interval-seconds output climbing in lockstep
+    /// with buffered_bytes right up to the kernel's SIGKILL. Many small segments (each tiny, well
+    /// under the byte cap) must still trip abandonment once there are simply too many of them --
+    /// legitimate reordering resolves within a handful of segments, not dozens.
+    #[test]
+    fn gap_abandoned_when_pending_packet_count_exceeds_limit() {
+        let mut r = StreamReassembler::with_pending_limits(PendingLimits {
+            max_bytes: 10_000_000, // generous -- packet count must be what trips this, not bytes
+            max_packets: 5,
+            max_age: Duration::from_secs(3600), // generous -- age must not be what trips this
+        });
+        r.set_isn(1000);
+        // First segment (closing the gap at the true start) never arrives. Five single-byte
+        // out-of-order segments (at the cap, not yet over it), each individually negligible in
+        // size, then a 6th that pushes it over.
+        for i in 0..5u32 {
+            assert_eq!(
+                push(&mut r, 2000 + i, b"x"),
+                PushOutcome::BufferedOutOfOrder,
+                "segment {i} must not yet trip any limit -- at most 5 pending so far, at the cap"
+            );
+        }
+        assert_eq!(
+            push(&mut r, 2005, b"x"),
+            PushOutcome::GapAbandoned { bytes: 1 },
+            "the 6th concurrently-pending segment must trip max_packets even though total bytes are tiny"
+        );
+    }
+
+    /// Regression test for the same real production OOM as the packet-count test above -- the
+    /// other half of why a single limit isn't enough: a low-traffic connection with a permanent
+    /// gap might never accumulate enough bytes *or* packets to trip either of those limits, all
+    /// while quietly holding the gap open indefinitely. Age doesn't care how much or how little
+    /// arrived in the meantime.
+    #[test]
+    fn gap_abandoned_when_pending_age_exceeds_limit() {
+        let mut r = StreamReassembler::with_pending_limits(PendingLimits {
+            max_bytes: 10_000_000, // generous -- age must be what trips this, not bytes
+            max_packets: 10_000,   // generous -- age must be what trips this, not packet count
+            max_age: Duration::from_millis(20),
+        });
+        r.set_isn(1000);
+        assert_eq!(
+            push(&mut r, 2000, b"x"),
+            PushOutcome::BufferedOutOfOrder,
+            "one lone out-of-order byte must not immediately trip anything"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            push(&mut r, 2001, b"y"),
+            PushOutcome::GapAbandoned { bytes: 2 },
+            "the gap has been open longer than max_age -- must abandon everything at once, \
+             regardless of how little data that is"
+        );
+        assert_eq!(
+            r.pending_len(),
+            0,
+            "age-triggered abandonment gives up on the whole gap, not just a partial trim"
+        );
     }
 
     #[test]

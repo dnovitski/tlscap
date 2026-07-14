@@ -14,7 +14,7 @@ use crate::connection::{self, ConnectionState};
 use crate::keylog_source::KeylogSource;
 use crate::lua::{FrameFields, LuaEngine};
 use crate::pcap_input::TcpFrame;
-use crate::reassembly::{PushOutcome, StreamReassembler};
+use crate::reassembly::{PendingLimits, PushOutcome, StreamReassembler};
 use crate::tls12;
 
 type Endpoint = (IpAddr, u16);
@@ -83,12 +83,16 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(client_endpoint: Endpoint, server_endpoint: Endpoint, max_pending_bytes: usize) -> Self {
+    fn new(
+        client_endpoint: Endpoint,
+        server_endpoint: Endpoint,
+        pending_limits: PendingLimits,
+    ) -> Self {
         Connection {
             client_endpoint,
             server_endpoint,
-            reassembler_c2s: StreamReassembler::with_max_pending_bytes(max_pending_bytes),
-            reassembler_s2c: StreamReassembler::with_max_pending_bytes(max_pending_bytes),
+            reassembler_c2s: StreamReassembler::with_pending_limits(pending_limits),
+            reassembler_s2c: StreamReassembler::with_pending_limits(pending_limits),
             state: None,
             tail_c2s: Vec::new(),
             tail_s2c: Vec::new(),
@@ -116,13 +120,13 @@ impl Connection {
 
     /// Marks this direction permanently desynced and drops whatever its reassembler was
     /// currently holding (garbage from this point on either way, no point keeping it around).
-    fn mark_desynced(&mut self, is_client_to_server: bool, max_pending_bytes: usize) {
+    fn mark_desynced(&mut self, is_client_to_server: bool, pending_limits: PendingLimits) {
         if is_client_to_server {
             self.desynced_c2s = true;
-            self.reassembler_c2s = StreamReassembler::with_max_pending_bytes(max_pending_bytes);
+            self.reassembler_c2s = StreamReassembler::with_pending_limits(pending_limits);
         } else {
             self.desynced_s2c = true;
-            self.reassembler_s2c = StreamReassembler::with_max_pending_bytes(max_pending_bytes);
+            self.reassembler_s2c = StreamReassembler::with_pending_limits(pending_limits);
         }
     }
 
@@ -226,6 +230,10 @@ pub struct OrchestratorConfig {
     /// connection map, so its cost scales with this interval rather than every single packet.
     pub sweep_interval: Duration,
     pub max_pending_bytes: usize,
+    /// See `PendingLimits::max_packets`'s doc comment in `reassembly.rs`.
+    pub max_pending_packets: usize,
+    /// See `PendingLimits::max_age`'s doc comment in `reassembly.rs`.
+    pub max_pending_age: Duration,
     /// Hard cap on `Connection::tail_c2s`/`tail_s2c`'s size (see its doc comment) -- a safety net
     /// for a dissector that's registered but doesn't consume much of what it's handed (a bug, or
     /// a stream that never lets it make progress), NOT the primary defense: a port with no
@@ -261,6 +269,8 @@ impl Default for OrchestratorConfig {
             idle_timeout: None,
             sweep_interval: Duration::from_secs(60),
             max_pending_bytes: crate::reassembly::DEFAULT_MAX_PENDING_BYTES,
+            max_pending_packets: crate::reassembly::DEFAULT_MAX_PENDING_PACKETS,
+            max_pending_age: crate::reassembly::DEFAULT_MAX_PENDING_AGE,
             max_tail_bytes: DEFAULT_MAX_TAIL_BYTES,
             lua_gc_interval: Duration::from_secs(5),
         }
@@ -432,11 +442,15 @@ impl Orchestrator {
         let key = conn_key(src, dst);
 
         let is_new = !self.connections.contains_key(&key);
-        let max_pending_bytes = self.config.max_pending_bytes;
+        let pending_limits = PendingLimits {
+            max_bytes: self.config.max_pending_bytes,
+            max_packets: self.config.max_pending_packets,
+            max_age: self.config.max_pending_age,
+        };
         let conn = self
             .connections
             .entry(key)
-            .or_insert_with(|| Connection::new(src, dst, max_pending_bytes));
+            .or_insert_with(|| Connection::new(src, dst, pending_limits));
 
         // A genuine SYN (not SYN-ACK) definitively identifies the initiator; only trust it to
         // (re-)anchor client/server on a fresh connection, never retroactively correct an
@@ -487,7 +501,7 @@ impl Orchestrator {
                     if is_client_to_server { "c2s" } else { "s2c" },
                     bytes
                 );
-                conn.mark_desynced(is_client_to_server, max_pending_bytes);
+                conn.mark_desynced(is_client_to_server, pending_limits);
                 self.connections_desynced += 1;
                 eprintln!(
                     "tlscap: WARNING connection {key:?} direction={} permanently desynced -- no further TLS records will be parsed for this direction (the other direction and this connection's packet-level events are unaffected)",

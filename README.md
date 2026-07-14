@@ -123,7 +123,9 @@ tlscap -w <output-prefix> -e <field> [-e <field> ...] [--keylog <path>] [options
 | `--compress <gzip>` | | Compress rotated output chunks. `gzip` is the only supported value (matching `editcap`). |
 | `--compress-level <0-9>` | `6` | gzip compression level (0 = none, 9 = max, 6 = zlib's own default). Unlike `editcap` (no level control at all), this is tunable — worth lowering in a live-capture pipeline where CPU spent compressing competes with `tcpdump`'s own need to drain its kernel capture buffer promptly. |
 | `--idle-timeout-seconds <secs>` | `0` (disabled) | Evict a connection after this many idle seconds, **regardless of FIN/RST**. Leave disabled in production — see [Why](#why-this-exists-instead-of-just-using-tshark). |
-| `--max-pending-bytes <bytes>` | `4194304` | Per-(connection,direction) cap on out-of-order-buffered bytes before a gap is treated as abandoned (logged loudly, never silently). |
+| `--max-pending-bytes <bytes>` | `4194304` | Per-(connection,direction) cap on out-of-order-buffered bytes before a gap is treated as abandoned (logged loudly, never silently). Protects against a single large permanent gap; see the next two flags for the limits that catch permanent gaps too small to ever trip this one. |
+| `--max-pending-packets <count>` | `50` | Per-(connection,direction) cap on the number of out-of-order segments buffered before a gap is treated as abandoned. Catches busy connections whose permanent gap accumulates many small segments long before `--max-pending-bytes` would trip. |
+| `--max-pending-age-seconds <secs>` | `30` | Per-(connection,direction) age limit on how long a gap may stay open before it's treated as abandoned. Catches low-traffic connections whose permanent gap never accumulates enough bytes or packets to trip either of the other two limits. |
 | `--max-tail-bytes <bytes>` | `1048576` | Per-(connection,direction) cap on undissected tail bytes carried into the next record before they're truncated (logged loudly, never silently). Safety net for a registered dissector that doesn't consume much of what it's handed — a port with no dissector at all never accumulates a tail in the first place. |
 | `--stats-interval-seconds <secs>` | `60` | Log a `tlscap: stats ...` line this often: process RSS, active connections, bytes buffered in reassembly, keylog entry count, and running packet/message counters — for diagnosing gradual memory growth. `0` disables it. |
 | `--lua-gc-interval-seconds <secs>` | `5` | Force a full Lua GC cycle at most this often, as a low-cost safety net against Lua's own incremental collector falling behind under sustained high throughput. |
@@ -360,11 +362,28 @@ self-consistent against `tlscap`'s own test fixtures.
   forced Lua GC cycle (`--lua-gc-interval-seconds`) are kept as low-cost safety nets for mechanisms
   that are real in principle, not because either has been shown to matter in practice.
 
-  **The original OOM's root cause remains unconfirmed.** If you're chasing one, don't assume it's
-  any of the above -- watch `--stats-interval-seconds`'s real output in the actual failing
-  environment; a >1-hour-old local replay of a single task's traffic wasn't able to reproduce it.
-  `--features dhat-heap` (see `Cargo.toml`'s `[profile.dhat]`) is a permanent, zero-cost-when-
-  disabled way to profile allocations locally if a pattern does emerge.
+  **The original OOM's root cause was found and fixed.** It wasn't allocator churn, Lua GC pacing,
+  or either bug above -- it was `pending` (the out-of-order reassembly buffer) accumulating
+  indefinitely. A gap in `pending` doesn't necessarily mean data was lost on the real wire: it can
+  mean *this capture* missed a packet, e.g. to an AF_PACKET kernel ring-buffer overflow (see
+  `--stats-interval-seconds` and the buffer-sizing flags on the capture side). The real sender
+  already got ACK'd by the real receiver and will never retransmit, so that gap is permanent from
+  `tlscap`'s point of view even though the underlying connection is completely healthy. Before this
+  fix, only `--max-pending-bytes` guarded against it -- fine for a busy connection whose gap
+  accumulates bytes fast, but a connection with a small, permanent gap could sit forever just under
+  that cap without ever being evicted. A single kernel ring-buffer overflow drops packets
+  indiscriminately across every connection sharing that capture socket, so one such event could
+  produce many simultaneous small permanent gaps whose aggregate `pending` bytes summed into
+  hundreds of MB of RSS growth, up to an actual OOM kill -- confirmed via direct correlation between
+  `Orchestrator::buffered_bytes()` and observed RSS in production logs, right up to the kill event.
+  Fixed with two more independent limits alongside `--max-pending-bytes`, whichever trips first:
+  `--max-pending-packets` (catches busy connections' permanent gaps well before the byte cap would)
+  and `--max-pending-age-seconds` (catches low-traffic connections' permanent gaps that never
+  accumulate enough bytes or packets to trip either of the other two). See `PendingLimits` in
+  [`src/reassembly.rs`](src/reassembly.rs) for the full design rationale.
+
+  `--features dhat-heap` (see `Cargo.toml`'s `[profile.dhat]`) remains available as a permanent,
+  zero-cost-when-disabled way to profile allocations locally if a different pattern ever emerges.
 
 ## License
 
